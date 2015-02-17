@@ -1,0 +1,163 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.thl.analytics
+
+import java.sql.{SQLType, Connection, ResultSet, Types}
+
+import org.apache.spark.api.java.function.{Function => JFunction}
+import org.apache.spark.rdd.RDD
+import org.apache.spark.{Logging, Partition, SparkContext, TaskContext}
+import org.apache.spark.sql._
+
+import scala.reflect.ClassTag
+
+private[analytics] class TableJdbcPartition(idx: Int, val startAt: Long, val limit: Long) extends Partition {
+  override def index = idx
+}
+// TODO: Expose a jdbcRDD function in SparkContext and mark this as semi-private
+/**
+ * An RDD that executes an SQL query on a JDBC connection and reads results.
+ * For usage example, see test case JdbcRDDSuite.
+ *
+ * @param getConnection a function that returns an open Connection.
+ *   The RDD takes care of closing the connection.
+ * @param sql the text of the query.
+ *   The query must contain two ? placeholders for parameters used to partition the results.
+ *   E.g. "select title, author from books where ? <= id and id <= ?"
+ * @param cnt the number of records to be read in total
+ * @param numPartitions the number of partitions.
+ *   Given a lowerBound of 1, an upperBound of 20, and a numPartitions of 2,
+ *   the query would be executed twice, once with (1, 10) and once with (11, 20)
+ * @param mapRow a function from a ResultSet to a single row of the desired result type(s).
+ *   This should only call getInt, getString, etc; the RDD takes care of calling next.
+ *   The default maps a ResultSet to an array of Object.
+ */
+class TableJdbcRDD[T: ClassTag](
+    sc: SparkContext,
+    getConnection: () => Connection,
+    table: String,
+    numPartitions: Int,
+    mapRow: (ResultSet) => T = TableJdbcRDD.resultSetToObjectArray _)
+  extends RDD[T](sc, Nil) with Logging {
+
+  override def getPartitions: Array[Partition] = {
+    val connection = getConnection()
+    val rs  = connection.createStatement().executeQuery("select count(*) from "+table)
+    rs.next()
+    val cnt = rs.getLong(1)
+    connection.close()
+
+    val extra: Long = cnt % numPartitions
+    val limitPerPartition: Long = cnt / numPartitions
+
+    (0 until numPartitions).map(i => {
+      val startAt = (i * limitPerPartition).toLong
+      //for the last partition add on the remainder
+      val limit = if (i == numPartitions - 1) limitPerPartition + extra else limitPerPartition
+      new TableJdbcPartition(i, startAt, limit)
+    }).toArray
+  }
+
+  override def compute(thePart: Partition, context: TaskContext) = new NextIterator[T] {
+    context.addTaskCompletionListener{ context => closeIfNeeded() }
+    val part = thePart.asInstanceOf[TableJdbcPartition]
+    val conn = getConnection()
+    val stmt = conn.prepareStatement("select * from "+ table + " LIMIT ? OFFSET ?", ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY)
+
+    // setFetchSize(Integer.MIN_VALUE) is a mysql driver specific way to force streaming results,
+    // rather than pulling entire resultset into memory.
+    // see http://dev.mysql.com/doc/refman/5.0/en/connector-j-reference-implementation-notes.html
+    if (conn.getMetaData.getURL.matches("jdbc:mysql:.*")) {
+      stmt.setFetchSize(Integer.MIN_VALUE)
+      logInfo("statement fetch size set to: " + stmt.getFetchSize + " to force MySQL streaming ")
+    }
+
+    stmt.setLong(1, part.limit)
+    stmt.setLong(2, part.startAt)
+    val rs = stmt.executeQuery()
+
+    val meta = rs.getMetaData
+    if(TableJdbcRDD.schema == null) TableJdbcRDD.schema = StructType((1 to meta.getColumnCount).map(
+      i => StructField(meta.getColumnLabel(i), TableJdbcRDD.sqlTypeToSparkSql(meta.getColumnType(i)), meta.isNullable(i) > 0)))
+
+
+    override def getNext: T = {
+      if (rs.next()) {
+        mapRow(rs)
+      } else {
+        finished = true
+        null.asInstanceOf[T]
+      }
+    }
+
+    override def close() {
+      try {
+        if (null != rs && ! rs.isClosed()) {
+          rs.close()
+        }
+      } catch {
+        case e: Exception => logWarning("Exception closing resultset", e)
+      }
+      try {
+        if (null != stmt && ! stmt.isClosed()) {
+          stmt.close()
+        }
+      } catch {
+        case e: Exception => logWarning("Exception closing statement", e)
+      }
+      try {
+        if (null != conn && ! conn.isClosed()) {
+          conn.close()
+        }
+        logInfo("closed connection")
+      } catch {
+        case e: Exception => logWarning("Exception closing connection", e)
+      }
+    }
+  }
+}
+
+object TableJdbcRDD {
+  def sqlTypeToSparkSql(sql: Int): DataType = {
+    sql match
+    {
+      case Types.VARCHAR | Types.CHAR | Types.LONGVARCHAR => StringType
+      case Types.BIGINT => LongType
+      case Types.INTEGER => IntegerType
+      case Types.FLOAT => FloatType
+      case Types.DATE  => DateType
+      case Types.TIME | Types.TIME_WITH_TIMEZONE | Types.TIMESTAMP | Types.TIMESTAMP_WITH_TIMEZONE => TimestampType
+      case Types.DOUBLE => DoubleType
+      case Types.BOOLEAN => BooleanType
+      case _ => StringType
+    }
+  }
+
+  var schema : StructType = _
+
+
+  def resultSetToObjectArray(rs: ResultSet): Row = {
+    val rowAsObj = Array.tabulate[Object](rs.getMetaData.getColumnCount)(i => rs.getObject(i + 1))
+    Row(rowAsObj: _*)
+  }
+
+  private[analytics] def fakeClassTag[T]: ClassTag[T] = ClassTag.AnyRef.asInstanceOf[ClassTag[T]]
+}
+
+
+

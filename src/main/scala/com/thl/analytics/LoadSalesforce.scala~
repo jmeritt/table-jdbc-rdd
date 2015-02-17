@@ -1,0 +1,34 @@
+/**
+ * Created by jmeritt on 2/8/15.
+ */
+
+package com.thl.analytics
+
+import java.sql.DriverManager
+import org.apache.spark.api.java.JavaSparkContext
+
+
+object LoadSalesforce {
+
+
+  val driverClass = "com.ddtek.jdbc.ddcloud.DDCloudDriver"
+  val url = "jdbc:datadirect:ddcloud://service.datadirectcloud.com;databaseName=SFDC"
+  val username = "jmeritt"
+  val password = "7ju$u7kJ"
+  val sparkHome = "/Users/jmeritt/Documents/Development/spark-1.2.0"
+
+  val jars = Array(
+    "/Users/jmeritt/Documents/Development/OffsetJdbcRDD/target/scala-2.10/offset-jdbcrdd_2.10-0.1.0.jar",
+    "/Users/jmeritt/Documents/Development/D2CDriver2/lib/ddcloud.jar"
+  )
+
+
+  def main(args: Array[String]) {
+    Class.forName(driverClass)
+    val jsc = new JavaSparkContext("local[4]", "SFDCAnalytics", sparkHome, jars)
+    val rdd = new OffsetJdbcRDD(jsc, () => DriverManager.getConnection(url, username, password), "Account", 4)
+    println("Count of Account is:"+rdd.count())
+  }
+}
+
+
